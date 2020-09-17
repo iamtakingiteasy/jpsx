@@ -55,10 +55,13 @@ package org.apache.bcel.util;
  */
 
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+
 import org.apache.bcel.Constants;
 import org.apache.bcel.generic.*;
-import com.sun.org.apache.regexp.internal.RESyntaxException;
-import com.sun.org.apache.regexp.internal.RE;
+
 
 /**
  * InstructionFinder is a tool to search for given instructions patterns,
@@ -230,23 +233,25 @@ public class InstructionFinder {
       throw new ClassGenException("Instruction handle " + from +
                   " not found in instruction list.");
     try {
-      RE regex = new RE(search);
+      Pattern regex = Pattern.compile(search);
+      Matcher matcher = regex.matcher(il_string.substring(start));
       ArrayList matches = new ArrayList();
 
-      while(start < il_string.length() && regex.match(il_string, start)) {
-    int startExpr = regex.getParenStart(0);
-    int endExpr   = regex.getParenEnd(0);
-    int lenExpr   = regex.getParenLength(0);
+      for(int i = 0; i < matcher.groupCount(); i++) {
+        int startExpr = matcher.start(i);
+        int endExpr = matcher.start(i);
+        int lenExpr = endExpr - startExpr;
 
-    InstructionHandle[] match = getMatch(startExpr, lenExpr);
 
-    if((constraint == null) || constraint.checkCode(match))
-      matches.add(match);
-    start = endExpr;
+        InstructionHandle[] match = getMatch(startExpr, lenExpr);
+
+        if((constraint == null) || constraint.checkCode(match))
+          matches.add(match);
+        start = endExpr;
       }
 
       return matches.iterator();
-    } catch(RESyntaxException e) {
+    } catch(PatternSyntaxException e) {
       System.err.println(e);
     }
 

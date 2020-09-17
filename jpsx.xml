@@ -135,6 +135,9 @@
 	    <property name="speculativeCompilation" value="${speculativeCompilation}"/>
         </component>
         <include refid="console-bits"/>
+        <component classname="org.jpsx.runtime.debugcomponents.emulator.console.Console">
+            <property name="remoteDebug" value="127.0.0.1:12345" />
+        </component>
     </components>
 
     <components id="common-and-console-bits">

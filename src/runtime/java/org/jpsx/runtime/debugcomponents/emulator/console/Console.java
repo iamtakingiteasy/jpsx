@@ -31,6 +31,13 @@ import org.jpsx.runtime.components.hardware.gte.GTE;
 import org.jpsx.runtime.util.MiscUtil;
 
 import java.io.*;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Scanner;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class Console extends JPSXComponent implements Runnable, CPUListener {
     protected int lastDisAddress;
@@ -40,6 +47,9 @@ public class Console extends JPSXComponent implements Runnable, CPUListener {
     private R3000 r3000;
     private CPUControl cpuControl;
     private Quartz quartz;
+
+    private final BlockingQueue<String> cmd = new ArrayBlockingQueue<>(10);
+    private BlockingQueue<String> remoteDebugReply;
 
     public void init() {
         super.init();
@@ -60,6 +70,67 @@ public class Console extends JPSXComponent implements Runnable, CPUListener {
         super("JPSX Basic Console");
     }
 
+    private void processDebugSocket(Socket sock) {
+        cpuControl.pause();
+
+        while (!sock.isClosed()) {
+            try (InputStream is = sock.getInputStream()) {
+                BufferedReader br = new BufferedReader(new InputStreamReader(is));
+
+                String line;
+                while ((line = br.readLine()) != null) {
+                    cmd.add("\u0001" + line);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void startListener(String remoteDebug) {
+        String[] parts = remoteDebug.split(":");
+        if (parts.length != 2) {
+            throw new RuntimeException("Invalid remoteDebug listen address");
+        }
+
+        int port = Integer.parseInt(parts[1]);
+
+        remoteDebugReply = new ArrayBlockingQueue<>(10);
+
+        new Thread(() -> {
+            try (ServerSocket serverSocket = new ServerSocket(port)) {
+                while (!serverSocket.isClosed()) {
+                    Socket accept = serverSocket.accept();
+                    new Thread(() -> writeDebugSocket(accept)).start();
+                    processDebugSocket(accept);
+                    accept.close();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    private void writeDebugSocket(Socket sock) {
+        try (OutputStreamWriter bw = new OutputStreamWriter(sock.getOutputStream())) {
+            bw.write("Hello, JPSX here.\r\n");
+            bw.flush();
+
+            while (!sock.isClosed()) {
+                String take = remoteDebugReply.take();
+                bw.write(take + "\r\n");
+                bw.flush();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            try {
+                sock.close();
+            } catch (IOException ioException) {
+                ioException.printStackTrace();
+            }
+        }
+    }
+
     public void run() {
         System.out.println("JPSX Copyright (C) 2003, 2014 Graham Sanderson");
         System.out.println("This program comes with ABSOLUTELY NO WARRANTY; type 'l' for details.");
@@ -68,20 +139,42 @@ public class Console extends JPSXComponent implements Runnable, CPUListener {
         System.out.println();
         dumpMainRegs();
 
+        String remoteDebug = getProperty("remoteDebug", "");
+        if (!remoteDebug.isBlank()) {
+            System.out.println("Remote debugging on " + remoteDebug);
+            startListener(remoteDebug);
+        }
+
         int lastDumpAddress = 0;
         DataInputStream input = new DataInputStream(System.in);
         boolean quit = false;
+
+        new Thread(() -> {
+            try {
+                while (true) {
+                    String line = input.readLine();
+                    cmd.add(line);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
 
         long msBase = System.currentTimeMillis();
         long clockBase = quartz.nanoTime();
         showCurrentInstruction();
         try {
             while (!quit) {
-                String line = input.readLine();
+                String line = cmd.take();
                 if (line == null || line.length() == 0) {
                     continue;
                 }
+
                 switch (line.charAt(0)) {
+                    case '\u0001':
+                        String cmd = line.substring(1);
+                        processDebugCmd(cmd);
+                        break;
                     case'r':
                         dumpMainRegs();
                         break;
@@ -368,6 +461,51 @@ public class Console extends JPSXComponent implements Runnable, CPUListener {
         }
     }
 
+    private int toremove = 0;
+
+    private void processDebugCmd(String cmd) {
+        try (Scanner scanner = new Scanner(cmd)) {
+            int idx = scanner.nextInt(16);
+            if (idx == DebuggerCmd.CMD_GET_PC_REG.getInt()) {
+                remoteDebugReply.add(String.format("210 PC=%08X", r3000.getPC()));
+            } else if (idx == DebuggerCmd.CMD_GET_GPR_REG.getInt()) {
+                int gpr = scanner.nextInt(16);
+                remoteDebugReply.add(String.format("211 %02X(r%d)=%08X", gpr, gpr, r3000.getReg(gpr)));
+            } else if (idx == DebuggerCmd.CMD_GET_LO_HI_REGS.getInt()) {
+                remoteDebugReply.add(String.format("212 LO=%08X HI=%08X", r3000.getLO(), r3000.getHI()));
+            } else if (idx == DebuggerCmd.CMD_RESUME_EXECUTION.getInt()) {
+                cpuControl.go();
+                remoteDebugReply.add("OK");
+            } else if (idx == DebuggerCmd.CMD_PAUSE_EXECUTION.getInt()) {
+                cpuControl.pause();
+                remoteDebugReply.add("OK");
+            } else if (idx == DebuggerCmd.CMD_STEP_OVER.getInt()) {
+                if (toremove != 0) {
+                    cpuControl.removeBreakpoint(toremove);
+                    toremove = 0;
+                }
+                toremove = r3000.getPC()+4;
+                cpuControl.addBreakpoint(toremove);
+                cpuControl.go();
+                remoteDebugReply.add("OK");
+            } else if (idx == DebuggerCmd.CMD_TRACE_EXECUTION.getInt()) {
+                cpuControl.step();
+                remoteDebugReply.add("OK");
+            } else if (idx == DebuggerCmd.CMD_RUN_TO.getInt()) {
+                if (toremove != 0) {
+                    cpuControl.removeBreakpoint(toremove);
+                    toremove = 0;
+                }
+                toremove = scanner.nextInt(16);
+                cpuControl.addBreakpoint(toremove);
+                cpuControl.go();
+                remoteDebugReply.add("OK");
+            } else {
+                System.out.println("Unknown debugger command: " + idx);
+            }
+        }
+    }
+
     public void showCurrentInstruction() {
         if (skipShow) {
             skipShow = false;
@@ -413,7 +551,26 @@ public class Console extends JPSXComponent implements Runnable, CPUListener {
     public void cpuResumed() {
     }
 
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    static class OneShotTask implements Runnable {
+        final int toremove;
+        final CPUControl cpuControl;
+
+
+        OneShotTask(int toremove, CPUControl cpuControl) {
+            this.toremove = toremove;
+            this.cpuControl = cpuControl;
+        }
+
+        public void run() {
+            cpuControl.removeBreakpoint(toremove);
+        }
+    }
+
     public void cpuPaused() {
-        showCurrentInstruction();
+        if (toremove != 0) {
+            executor.submit(new OneShotTask(toremove, cpuControl));
+            toremove = 0;
+        }
     }
 }
